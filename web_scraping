@@ -1,0 +1,27 @@
+import requests
+from bs4 import BeautifulSoup
+import json
+
+url = "https://books.toscrape.com/"
+response = requests.get(url)
+
+soup = BeautifulSoup(response.text, "html.parser")
+books = soup.find_all("article", class_="product_pod")
+
+data = []
+
+for book in books:
+    title = book.h3.a["title"]
+    price = book.find("p", class_="price_color").text
+    availability = book.find("p", class_="instock availability").text.strip()
+
+    data.append({
+        "title": title,
+        "price": price,
+        "availability": availability
+    })
+
+with open("books.json", "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=4, ensure_ascii=False)
+
+print("Scraping completed. Data saved to books.json")
