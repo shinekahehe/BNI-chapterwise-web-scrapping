@@ -107,17 +107,74 @@ async def scrape_profile(context, base: Tuple[str, str, str, str]) -> Dict[str, 
     page = await context.new_page()
     try:
         await page.route("**/*", _block_heavy_resources)
-        await page.goto(profile_url, timeout=60_000, wait_until="domcontentloaded")
+        # Some profiles are slow; retry once before giving up.
+        last_err: Optional[Exception] = None
+        for attempt in range(2):
+            try:
+                await page.goto(profile_url, timeout=90_000, wait_until="domcontentloaded")
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                await page.wait_for_timeout(600 * (attempt + 1))
+        if last_err:
+            data = {
+                "name": name,
+                "business": business,
+                "category": category,
+                "phone": None,
+                "top_product": None,
+                "ideal_referral": None,
+                "top_problem_solved": None,
+                "my_favourite_bni_story": None,
+                "_error": f"profile_goto_failed: {last_err}",
+            }
+            # Only include my_business when present (keeps output clean for chapters where it is always empty)
+            # (No-op here since it's unset on failures.)
+            return data
 
+        # --- PHONE ---
+        # Different BNI templates expose phone differently:
+        # - Sometimes as a simple <a href="tel:...">
+        # - Sometimes inside .memberContactDetails, where the visible text is the phone number
+        # - Sometimes only as plain text (no tel: link)
         phone: Optional[str] = None
         try:
             tel = await page.query_selector('a[href^="tel:"]')
             if tel:
                 href = await tel.get_attribute("href")
                 if href and href.startswith("tel:"):
-                    phone = href.replace("tel:", "").strip()
-        except PlaywrightTimeoutError:
+                    phone = href.replace("tel:", "").strip() or None
+        except Exception:
             phone = None
+
+        # Fallback 1: `.memberContactDetails a[href^='tel:']` (chapterdetails.py style)
+        if not phone:
+            try:
+                tel2 = await page.query_selector(".memberContactDetails a[href^='tel:']")
+                if tel2:
+                    txt = (await tel2.inner_text()).strip()
+                    if txt:
+                        phone = txt
+                    else:
+                        href2 = await tel2.get_attribute("href")
+                        if href2 and href2.startswith("tel:"):
+                            phone = href2.replace("tel:", "").strip() or None
+            except Exception:
+                pass
+
+        # Fallback 2: regex from contact details text
+        if not phone:
+            try:
+                contact = await page.query_selector(".memberContactDetails")
+                if contact:
+                    blob = (await contact.inner_text()).strip()
+                    # Match common India formats (+91, spaces, dashes)
+                    m = re.search(r"(?:\\+?91[-\\s]?)?([6-9]\\d{9})", blob)
+                    if m:
+                        phone = m.group(1)
+            except Exception:
+                pass
 
         section_data: Dict[str, Optional[str]] = {k: None for k in TARGET_SECTIONS}
         try:
@@ -134,19 +191,151 @@ async def scrape_profile(context, base: Tuple[str, str, str, str]) -> Dict[str, 
         except PlaywrightTimeoutError:
             pass
 
-        return {
+        data = {
             "name": name,
             "business": business,
             "category": category,
             "phone": phone,
-            "my_business": section_data["My Business"],
             "top_product": section_data["Top Product"],
             "ideal_referral": section_data["Ideal Referral"],
             "top_problem_solved": section_data["Top Problem Solved"],
             "my_favourite_bni_story": section_data["My Favourite BNI Story"],
         }
+        mb = section_data.get("My Business")
+        if mb:
+            data["my_business"] = mb
+        return data
     finally:
         await page.close()
+
+async def _prepare_member_list_page(page, start_url: str) -> None:
+    """
+    Navigates to start_url and ensures the member list table is visible.
+
+    Supports:
+    - direct /memberlist URLs
+    - /index URLs (often have a Members tab or a predictable /memberlist sibling)
+    - /chapterdetail URLs (often load Members table after clicking a tab)
+    """
+    await page.goto(start_url, timeout=90_000, wait_until="domcontentloaded")
+
+    # If already on a member list page, we're done.
+    if "/memberlist" in page.url:
+        await page.wait_for_selector("table.listtables tbody tr", timeout=60_000)
+        return
+
+    # Heuristic: many sites have .../en-IN/index and .../en-IN/memberlist
+    if page.url.endswith("/index"):
+        guess = page.url[:-len("/index")] + "/memberlist"
+        try:
+            await page.goto(guess, timeout=60_000, wait_until="domcontentloaded")
+            await page.wait_for_selector("table.listtables tbody tr", timeout=10_000)
+            return
+        except Exception:
+            # fall through to clicking "Members"
+            await page.goto(start_url, timeout=90_000, wait_until="domcontentloaded")
+
+    # Try clicking a "Members" / "Chapter Members" / "Show Members" tab/link
+    # (your CSS snippet shows `.nav-tabs` / `.leadership_tab` patterns).
+    # IMPORTANT: On some chapterdetail pages, "Show Members" is NOT an <a>, it's a button/div.
+    # We'll try both locator-based clicks and a JS scan (like your chapterdetails.py).
+    candidates = [
+        "a:has-text('Members')",
+        "a:has-text('MEMBERS')",
+        "a:has-text('Chapter Members')",
+        "a:has-text('CHAPTER MEMBERS')",
+        "a:has-text('Show Members')",
+        "a:has-text('SHOW MEMBERS')",
+        "text=Show Members",
+        "text=Chapter Members",
+        "li a:has-text('Members')",
+        "li a:has-text('Chapter Members')",
+        ".nav-tabs a:has-text('Members')",
+        ".nav-tabs a:has-text('Chapter Members')",
+        ".leadership_tab a:has-text('Members')",
+        ".leadership_tab a:has-text('Chapter Members')",
+    ]
+    for sel in candidates:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count():
+                # Many of these trigger a navigation to /memberlist. Try to catch it quickly.
+                try:
+                    async with page.expect_navigation(timeout=8_000):
+                        await loc.click(timeout=5_000)
+                except Exception:
+                    await loc.click(timeout=5_000)
+                await page.wait_for_timeout(800)
+                if "/memberlist" in page.url:
+                    await page.wait_for_selector("table.listtables tbody tr", timeout=60_000)
+                    return
+                await page.wait_for_selector("table.listtables tbody tr", timeout=20_000)
+                return
+        except Exception:
+            continue
+
+    # JS scan fallback: find any element whose *exact* text is 'Show Members' and click it.
+    # (This mirrors your working chapterdetails.py approach.)
+    try:
+        before = page.url
+        await page.evaluate(
+            """
+            () => {
+              const el = [...document.querySelectorAll('*')]
+                .find(e => e && e.textContent && e.textContent.trim() === 'Show Members');
+              if (el) el.click();
+            }
+            """
+        )
+        # Wait for navigation or table
+        await page.wait_for_timeout(1200)
+        if page.url != before and "/memberlist" in page.url:
+            await page.wait_for_selector("table.listtables tbody tr", timeout=60_000)
+            return
+        await page.wait_for_selector("table.listtables tbody tr", timeout=20_000)
+        return
+    except Exception:
+        pass
+
+    # Another JS scan: partial match for "Members" in case of different capitalization/whitespace.
+    try:
+        await page.evaluate(
+            """
+            () => {
+              const txt = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+              const el = [...document.querySelectorAll('a,button,li,div,span')]
+                .find(e => {
+                  const t = txt(e.textContent);
+                  return t === 'show members' || t === 'chapter members' || t === 'members';
+                });
+              if (el) el.click();
+            }
+            """
+        )
+        await page.wait_for_timeout(1200)
+        if "/memberlist" in page.url:
+            await page.wait_for_selector("table.listtables tbody tr", timeout=60_000)
+            return
+        await page.wait_for_selector("table.listtables tbody tr", timeout=20_000)
+        return
+    except Exception:
+        pass
+
+    # Fallback: search HTML for a /memberlist link and navigate to it
+    html = await page.content()
+    # Some sites embed the member list link as plain text or in scripts.
+    m = re.search(r"(https?://[^\s\"']*/memberlist[^\s\"']+)", html)
+    if m:
+        await page.goto(m.group(1), timeout=60_000, wait_until="domcontentloaded")
+        await page.wait_for_selector("table.listtables tbody tr", timeout=60_000)
+        return
+    m = re.search(r'href="([^"]*/memberlist[^"]*)"', html)
+    if m:
+        await page.goto(urljoin(page.url, m.group(1)), timeout=60_000, wait_until="domcontentloaded")
+        await page.wait_for_selector("table.listtables tbody tr", timeout=60_000)
+        return
+
+    raise ValueError(f"Could not reach member list table from: {start_url}")
 
 
 async def scrape_chapter(chapter: Chapter, *, out_dir: str, profile_concurrency: int = 6) -> str:
@@ -166,37 +355,9 @@ async def scrape_chapter(chapter: Chapter, *, out_dir: str, profile_concurrency:
         # Block heavy resources for ALL pages in this context.
         await context.route("**/*", _block_heavy_resources)
 
-        async def resolve_to_memberlist(start_url: str) -> str:
-            """
-            Accepts:
-            - /memberlist urls (returns as-is)
-            - /index or /chapterdetail urls (tries to find a link containing '/memberlist')
-            """
-            if "/memberlist" in start_url:
-                return start_url
-
-            tmp = await context.new_page()
-            try:
-                await tmp.goto(start_url, timeout=60_000, wait_until="domcontentloaded")
-                # Try common link patterns.
-                link = await tmp.query_selector('a[href*="/memberlist"]')
-                if link:
-                    href = await link.get_attribute("href")
-                    if href:
-                        return urljoin(tmp.url, href)
-                # Fallback: search in page html for /memberlist
-                html = await tmp.content()
-                m = re.search(r'href="([^"]*/memberlist[^"]*)"', html)
-                if m:
-                    return urljoin(tmp.url, m.group(1))
-            finally:
-                await tmp.close()
-            raise ValueError(f"Could not resolve to /memberlist from: {start_url}")
-
         list_page = await context.new_page()
         try:
-            memberlist_url = await resolve_to_memberlist(url)
-            await list_page.goto(memberlist_url, timeout=60_000, wait_until="domcontentloaded")
+            await _prepare_member_list_page(list_page, url)
             bases = await extract_profile_links_from_memberlist(list_page)
         finally:
             await list_page.close()
@@ -205,11 +366,28 @@ async def scrape_chapter(chapter: Chapter, *, out_dir: str, profile_concurrency:
 
         async def worker(b: Tuple[str, str, str, str]) -> Dict[str, Any]:
             async with sem:
-                data = await scrape_profile(context, b)
+                try:
+                    data = await scrape_profile(context, b)
+                except Exception as e:
+                    name, business, category, profile_url = b
+                    data = {
+                        "name": name,
+                        "business": business,
+                        "category": category,
+                        "phone": None,
+                        "my_business": None,
+                        "top_product": None,
+                        "ideal_referral": None,
+                        "top_problem_solved": None,
+                        "my_favourite_bni_story": None,
+                        "_error": f"profile_failed: {e}",
+                        "_profile_url": profile_url,
+                    }
                 data["chapter"] = chapter.name
                 return data
 
-        members: List[Dict[str, Any]] = await asyncio.gather(*(worker(b) for b in bases))
+        # Don't let one failing profile kill the entire chapter.
+        members: List[Dict[str, Any]] = await asyncio.gather(*(worker(b) for b in bases), return_exceptions=False)
         await browser.close()
 
     with open(out_path, "w", encoding="utf-8") as f:
@@ -220,8 +398,11 @@ async def scrape_chapter(chapter: Chapter, *, out_dir: str, profile_concurrency:
 
 async def main() -> None:
     chapters = [Chapter(name=c["chapter"], url=c["url"]) for c in CHAPTERS]
+    only_re = os.environ.get("BNI_ONLY_CHAPTER_REGEX")
+    if only_re:
+        rx = re.compile(only_re, re.IGNORECASE)
+        chapters = [c for c in chapters if rx.search(c.name)]
 
-    out_dir = os.path.join(os.getcwd(), "output_bni")
     # Limit across chapters too, so you don't DOS the site or get blocked.
     chapter_concurrency = int(os.environ.get("BNI_CHAPTER_CONCURRENCY", "2"))
     profile_concurrency = int(os.environ.get("BNI_PROFILE_CONCURRENCY", "6"))
@@ -231,6 +412,12 @@ async def main() -> None:
     async def run_one(ch: Chapter) -> Optional[str]:
         async with sem:
             try:
+                # Separate folder for chapterdetail/coregroupdetail sources (like your chapterdetails.py flow)
+                if "chapterdetail" in ch.url or "coregroupdetail" in ch.url:
+                    out_dir = os.path.join(os.getcwd(), "output_bni_chapterdetails")
+                else:
+                    out_dir = os.path.join(os.getcwd(), "output_bni")
+
                 path = await scrape_chapter(ch, out_dir=out_dir, profile_concurrency=profile_concurrency)
                 print(f"[OK] {ch.name} -> {path}")
                 return path
@@ -240,7 +427,7 @@ async def main() -> None:
 
     results = await asyncio.gather(*(run_one(ch) for ch in chapters))
     ok = [r for r in results if r]
-    print(f"Done. Wrote {len(ok)} chapter JSON files to: {out_dir}")
+    print(f"Done. Wrote {len(ok)} chapter JSON files.")
 
 
 if __name__ == "__main__":
