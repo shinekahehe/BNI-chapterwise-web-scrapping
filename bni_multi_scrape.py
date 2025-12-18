@@ -206,6 +206,17 @@ async def scrape_profile(
         for attempt in range(2):
             try:
                 await page.goto(profile_url, timeout=90_000, wait_until="domcontentloaded")
+                # Wait for AJAX content to load (memberDetail section is populated via AJAX)
+                # Wait for either the company detail section or the profile sections to appear
+                try:
+                    await page.wait_for_selector(
+                        ".widgetMemberCompanyDetail, .widgetMemberProfileTop, .widgetProfile",
+                        timeout=15_000
+                    )
+                    await page.wait_for_timeout(1_500)  # Extra delay for AJAX content to fully render
+                except PlaywrightTimeoutError:
+                    # If sections don't appear, wait a bit more
+                    await page.wait_for_timeout(2_000)
                 last_err = None
                 break
             except Exception as e:
@@ -217,14 +228,16 @@ async def scrape_profile(
                 "business": business,
                 "category": category,
                 "phone": phone_from_list or None,
+                "company_name": None,
+                "company_address": None,
+                "company_website": None,
+                "my_business": None,
                 "top_product": None,
                 "ideal_referral": None,
                 "top_problem_solved": None,
                 "my_favourite_bni_story": None,
                 "_error": f"profile_goto_failed: {last_err}",
             }
-            # Only include my_business when present (keeps output clean for chapters where it is always empty)
-            # (No-op here since it's unset on failures.)
             return data
 
         # --- PHONE ---
@@ -270,23 +283,115 @@ async def scrape_profile(
             except Exception:
                 pass
 
+        # Extract company name and address from .widgetMemberCompanyDetail section
+        company_name: Optional[str] = None
+        company_address: Optional[str] = None
+        company_website: Optional[str] = None
+        try:
+            # Wait for the company detail section to appear
+            await page.wait_for_selector(".widgetMemberCompanyDetail", timeout=10_000)
+            await page.wait_for_timeout(500)  # Small delay to ensure content is rendered
+            
+            company_info = await page.evaluate("""
+                () => {
+                    const section = document.querySelector('.widgetMemberCompanyDetail');
+                    if (section) {
+                        const h6 = section.querySelector('.textHolder h6');
+                        const p = section.querySelector('.textHolder p');
+                        const a = p ? p.querySelector('a') : null;
+                        
+                        let name = '';
+                        let address = '';
+                        let website = '';
+                        
+                        if (h6) {
+                            // Get text and split by <br> tags or newlines
+                            const html = h6.innerHTML;
+                            const lines = html.split(/<br\\s*\\/?>/i).map(l => l.replace(/<[^>]*>/g, '').trim()).filter(l => l);
+                            
+                            if (lines.length > 0) {
+                                // First line is usually "Mr./Ms./Mrs. Name", second is company name
+                                if (lines.length > 1) {
+                                    name = lines[1]; // Company name is usually second line
+                                    // Rest is address (lines 2 onwards)
+                                    if (lines.length > 2) {
+                                        address = lines.slice(2).join(', ');
+                                    }
+                                } else if (lines.length === 1) {
+                                    // Only one line - might be company name
+                                    name = lines[0];
+                                }
+                            }
+                        }
+                        
+                        if (a) {
+                            website = a.href || a.textContent.trim() || '';
+                            // Clean up website URL
+                            if (website && !website.startsWith('http://') && !website.startsWith('https://')) {
+                                website = 'http://' + website;
+                            }
+                        }
+                        
+                        return {name: name, address: address, website: website};
+                    }
+                    return {name: '', address: '', website: ''};
+                }
+            """)
+            company_name = (company_info.get("name") or "").strip() or None
+            company_address = (company_info.get("address") or "").strip() or None
+            company_website = (company_info.get("website") or "").strip() or None
+        except PlaywrightTimeoutError:
+            # Section doesn't exist, that's okay
+            pass
+        except Exception:
+            pass
+
         # Extract "My Business" from .widgetMemberTxtVideo section (special case)
+        # Wait a bit for the section to load, then extract
         my_business: Optional[str] = None
         try:
+            # Wait for the section to appear (with timeout)
+            await page.wait_for_selector(".widgetMemberTxtVideo", timeout=10_000)
+            await page.wait_for_timeout(500)  # Small delay to ensure content is rendered
+            
             my_business_content = await page.evaluate("""
                 () => {
                     const section = document.querySelector('.widgetMemberTxtVideo');
                     if (section) {
                         const h2 = section.querySelector('h2');
-                        if (h2 && h2.textContent.includes('My Business')) {
-                            const p = section.querySelector('p');
-                            return p ? p.textContent.trim() : '';
+                        if (h2 && h2.textContent.trim().includes('My Business')) {
+                            // Look for p tag in the row after h2
+                            const row = section.querySelector('.row');
+                            if (row) {
+                                // Find the div containing the p tag (usually after the h2 div)
+                                const cols = row.querySelectorAll('div[class*="col-"]');
+                                for (let col of cols) {
+                                    const p = col.querySelector('p');
+                                    if (p) {
+                                        const text = p.textContent.trim();
+                                        if (text && !text.includes('My Business')) {
+                                            return text;
+                                        }
+                                    }
+                                }
+                            }
+                            // Fallback: get any p tag in the section
+                            const allP = section.querySelectorAll('p');
+                            for (let p of allP) {
+                                const text = p.textContent.trim();
+                                if (text && !text.includes('My Business')) {
+                                    return text;
+                                }
+                            }
                         }
                     }
                     return '';
                 }
             """)
             my_business = (my_business_content or "").strip() or None
+        except PlaywrightTimeoutError:
+            # Section doesn't exist, that's okay
+            pass
         except Exception:
             pass
 
@@ -314,6 +419,9 @@ async def scrape_profile(
             "business": business,
             "category": category,
             "phone": phone,
+            "company_name": company_name,
+            "company_address": company_address,
+            "company_website": company_website,
             "my_business": my_business,  # Always include, even if null
             "top_product": section_data["Top Product"],
             "ideal_referral": section_data["Ideal Referral"],
