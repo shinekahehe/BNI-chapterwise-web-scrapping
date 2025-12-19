@@ -210,7 +210,7 @@ async def scrape_profile(
                 # Wait for either the company detail section or the profile sections to appear
                 try:
                     await page.wait_for_selector(
-                        ".widgetMemberCompanyDetail, .widgetMemberProfileTop, .widgetProfile, .profilephoto",
+                        ".widgetMemberCompanyDetail, .widgetMemberProfileTop, .widgetProfile, .profilephoto, .companyLogo",
                         timeout=25_000
                     )
                     await page.wait_for_timeout(3_000)  # Extra delay for AJAX content to fully render
@@ -235,6 +235,7 @@ async def scrape_profile(
                 "category": category,
                 "phone": phone_from_list or None,
                 "profile_image": None,
+                "company_logo": None,
                 "company_name": None,
                 "company_address": None,
                 "company_website": None,
@@ -306,12 +307,57 @@ async def scrape_profile(
         except Exception:
             pass
 
+        # Extract company logo
+        company_logo: Optional[str] = None
+        try:
+            # Wait for the company detail section to appear first
+            await page.wait_for_selector(".widgetMemberCompanyDetail", timeout=15_000)
+            await page.wait_for_timeout(1_000)  # Small delay to ensure content is rendered
+            
+            # Wait specifically for company logo to load
+            try:
+                await page.wait_for_selector(".companyLogo img, .widgetMemberCompanyDetail .companyLogo img", timeout=10_000)
+                await page.wait_for_timeout(1_500)  # Extra wait for logo image to load
+            except PlaywrightTimeoutError:
+                pass  # Continue even if logo doesn't appear
+            
+            # Try multiple selectors for company logo
+            logo_selectors = [
+                ".companyLogo img",
+                ".widgetMemberCompanyDetail .companyLogo img",
+                ".companyLogo a img",
+            ]
+            
+            for selector in logo_selectors:
+                try:
+                    logo_img = await page.query_selector(selector)
+                    if logo_img:
+                        logo_src = await logo_img.get_attribute("src")
+                        if logo_src and logo_src.strip():
+                            # Wait for image to be loaded
+                            try:
+                                await logo_img.wait_for_element_state("visible", timeout=5_000)
+                            except Exception:
+                                pass
+                            
+                            # Convert relative URL to absolute URL
+                            if logo_src.startswith("http://") or logo_src.startswith("https://"):
+                                company_logo = logo_src
+                            else:
+                                company_logo = urljoin(profile_url, logo_src)
+                            if company_logo:
+                                break  # Found a valid logo, stop trying other selectors
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
         # Extract company name and address from .widgetMemberCompanyDetail section
         company_name: Optional[str] = None
         company_address: Optional[str] = None
         company_website: Optional[str] = None
         try:
-            # Wait for the company detail section to appear
+            # Wait for the company detail section to appear (if not already waited)
             await page.wait_for_selector(".widgetMemberCompanyDetail", timeout=15_000)
             await page.wait_for_timeout(1_000)  # Small delay to ensure content is rendered
             
@@ -443,6 +489,7 @@ async def scrape_profile(
             "category": category,
             "phone": phone,
             "profile_image": profile_image,
+            "company_logo": company_logo,
             "company_name": company_name,
             "company_address": company_address,
             "company_website": company_website,
